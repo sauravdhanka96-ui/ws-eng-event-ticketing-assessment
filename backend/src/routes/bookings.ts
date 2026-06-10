@@ -1,17 +1,93 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma.js";
-import { createBookingSchema } from "../lib/validations.js";
+import { createBookingSchema, reassignBookingSchema } from "../lib/validations.js";
 import { authenticate } from "../middleware/auth.js";
 import { generateTicketCode, generateQRData, generateQRCodeDataURL } from "../lib/qr.js";
 import { calculateRefund } from "../lib/refund.js";
 import { incrementCapacity, decrementCapacity } from "../lib/capacity.js";
-
-// Booking ownership changes: see lib/transfer.ts for the cancel+create utility
-// used by organizer reassignment. For attendee-initiated transfers, consider
-// whether the full cancel+create cycle is needed or if a simpler ownership
-// update would suffice — see the NOTE in transfer.ts for trade-offs.
+import { transferBooking } from "../lib/transfer.js";
 
 const router = Router();
+
+async function promoteNextWaitlistedUser(tx: any, cancelledBooking: any) {
+  const waitlistEntries = await tx.waitlistEntry.findMany({
+    where: {
+      eventId: cancelledBooking.eventId,
+    },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+  });
+
+  for (const entry of waitlistEntries) {
+    const existingActiveBooking = await tx.booking.findFirst({
+      where: {
+        userId: entry.userId,
+        eventId: cancelledBooking.eventId,
+        status: {
+          in: ["CONFIRMED", "CHECKED_IN"],
+        },
+      },
+    });
+
+    if (existingActiveBooking) {
+      await tx.waitlistEntry.delete({
+        where: { id: entry.id },
+      });
+      continue;
+    }
+
+    const ticketCode = generateTicketCode();
+    const qrCodeData = generateQRData(ticketCode);
+
+    await incrementCapacity(tx, cancelledBooking.eventId, cancelledBooking.seatTierId);
+
+    const promotedBooking = await tx.booking.create({
+      data: {
+        ticketCode,
+        qrCodeData,
+        userId: entry.userId,
+        eventId: cancelledBooking.eventId,
+        seatTierId: cancelledBooking.seatTierId,
+        promoCodeId: null,
+        pricePaid: cancelledBooking.seatTier?.price ?? cancelledBooking.event.price,
+        discountAmount: 0,
+        status: "CONFIRMED",
+      },
+      include: {
+        event: {
+          select: {
+            id: true,
+            name: true,
+            date: true,
+            time: true,
+            venue: true,
+          },
+        },
+        seatTier: {
+          select: {
+            id: true,
+            name: true,
+            price: true,
+          },
+        },
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
+      },
+    });
+
+    await tx.waitlistEntry.delete({
+      where: { id: entry.id },
+    });
+
+    return promotedBooking;
+  }
+
+  return null;
+}
 
 // GET /api/bookings - List user's bookings
 router.get("/", authenticate, async (req, res) => {
@@ -19,6 +95,9 @@ router.get("/", authenticate, async (req, res) => {
     const bookings = await prisma.booking.findMany({
       where: {
         userId: req.user!.userId,
+        status: {
+          not: "TRANSFERRED",
+        },
       },
       include: {
         event: {
@@ -96,7 +175,7 @@ router.get("/:id", authenticate, async (req, res) => {
       },
     });
 
-    if (!booking) {
+    if (!booking || booking.status === "TRANSFERRED") {
       return res.status(404).json({
         success: false,
         error: "NOT_FOUND",
@@ -141,7 +220,7 @@ router.get("/:id/refund-preview", authenticate, async (req, res) => {
       },
     });
 
-    if (!booking) {
+    if (!booking || booking.status === "TRANSFERRED") {
       return res.status(404).json({
         success: false,
         error: "NOT_FOUND",
@@ -203,7 +282,6 @@ router.post("/", authenticate, async (req, res) => {
 
     const { eventId, seatTierId, promoCode } = result.data;
 
-    // Use transaction for atomic ticket purchase
     const booking = await prisma.$transaction(async (tx) => {
       const event = await tx.event.findUnique({
         where: { id: eventId },
@@ -218,7 +296,6 @@ router.post("/", authenticate, async (req, res) => {
         throw new Error("INVALID_EVENT:Event is not available for booking");
       }
 
-      // Check if user already has a booking for this event
       const existingBooking = await tx.booking.findFirst({
         where: {
           userId: req.user!.userId,
@@ -231,12 +308,10 @@ router.post("/", authenticate, async (req, res) => {
         throw new Error("DUPLICATE:You already have a ticket for this event");
       }
 
-      // Determine price based on tier or event base price
       let ticketPrice = event.price;
       let selectedTierId: string | null = null;
 
       if (event.seatTiers.length > 0) {
-        // Event has tiers — tier selection is required
         if (!seatTierId) {
           throw new Error("VALIDATION:Please select a seat tier");
         }
@@ -252,17 +327,12 @@ router.post("/", authenticate, async (req, res) => {
 
         ticketPrice = tier.price;
         selectedTierId = tier.id;
-      } else {
-        // No tiers — use event-level capacity
-        if (event.soldCount >= event.capacity) {
-          throw new Error("SOLD_OUT:Event is sold out");
-        }
+      } else if (event.soldCount >= event.capacity) {
+        throw new Error("SOLD_OUT:Event is sold out");
       }
 
-      // Increment capacity using centralized helper
       await incrementCapacity(tx, eventId, selectedTierId);
 
-      // Handle promo code
       let discountAmount = 0;
       let appliedPromoId: string | null = null;
 
@@ -279,7 +349,6 @@ router.post("/", authenticate, async (req, res) => {
           throw new Error("CODE_EXHAUSTED:This code has reached its usage limit");
         }
 
-        // Check promo code date validity
         const now = new Date();
         if (promo.validFrom && now < new Date(promo.validFrom)) {
           throw new Error("INVALID_CODE:This promo code is not yet active");
@@ -288,17 +357,14 @@ router.post("/", authenticate, async (req, res) => {
           throw new Error("INVALID_CODE:This promo code has expired");
         }
 
-        // Check minimum purchase amount
         if (promo.minPurchaseAmount && ticketPrice < promo.minPurchaseAmount) {
           throw new Error(
             `MIN_PURCHASE:Minimum purchase of $${promo.minPurchaseAmount.toFixed(2)} required for this code`
           );
         }
 
-        // Calculate discount
         if (promo.discountType === "PERCENTAGE") {
           discountAmount = ticketPrice * (promo.discountValue / 100);
-          // Apply max discount cap if set
           if (promo.maxDiscountAmount && discountAmount > promo.maxDiscountAmount) {
             discountAmount = promo.maxDiscountAmount;
           }
@@ -306,10 +372,8 @@ router.post("/", authenticate, async (req, res) => {
           discountAmount = promo.discountValue;
         }
 
-        // Ensure discount doesn't exceed ticket price
         discountAmount = Math.min(discountAmount, ticketPrice);
 
-        // Increment usage count
         await tx.promoCode.update({
           where: { id: promo.id },
           data: { usageCount: { increment: 1 } },
@@ -319,12 +383,9 @@ router.post("/", authenticate, async (req, res) => {
       }
 
       const finalPrice = Math.round((ticketPrice - discountAmount) * 100) / 100;
-
-      // Generate ticket
       const ticketCode = generateTicketCode();
       const qrCodeData = generateQRData(ticketCode);
 
-      // Create booking
       const newBooking = await tx.booking.create({
         data: {
           ticketCode,
@@ -441,20 +502,122 @@ router.post("/", authenticate, async (req, res) => {
   }
 });
 
+// POST /api/bookings/:id/transfer - Transfer a confirmed ticket to another registered user
+router.post("/:id/transfer", authenticate, async (req, res) => {
+  try {
+    const result = reassignBookingSchema.safeParse(req.body);
+    if (!result.success) {
+      return res.status(400).json({
+        success: false,
+        error: "VALIDATION_ERROR",
+        message: result.error.errors[0].message,
+      });
+    }
+
+    const { recipientEmail } = result.data;
+
+    const transferredBooking = await prisma.$transaction(async (tx) => {
+      const booking = await tx.booking.findUnique({
+        where: { id: req.params.id as string },
+      });
+
+      if (!booking || booking.status === "TRANSFERRED") {
+        throw new Error("NOT_FOUND:Booking not found");
+      }
+
+      if (booking.userId !== req.user!.userId) {
+        throw new Error("FORBIDDEN:You can only transfer your own bookings");
+      }
+
+      const recipient = await tx.user.findUnique({
+        where: { email: recipientEmail },
+      });
+
+      if (!recipient) {
+        throw new Error("RECIPIENT_NOT_FOUND:Recipient must have a registered account");
+      }
+
+      return transferBooking(tx, booking.id, recipient.id);
+    });
+
+    res.json({
+      success: true,
+      data: transferredBooking,
+      message: "Ticket transferred successfully",
+    });
+  } catch (error: unknown) {
+    const err = error as Error;
+    console.error("Error transferring booking:", err);
+
+    if (err.message?.startsWith("NOT_FOUND:")) {
+      return res.status(404).json({
+        success: false,
+        error: "NOT_FOUND",
+        message: err.message.split(":")[1],
+      });
+    }
+
+    if (err.message?.startsWith("FORBIDDEN:")) {
+      return res.status(403).json({
+        success: false,
+        error: "FORBIDDEN",
+        message: err.message.split(":")[1],
+      });
+    }
+
+    if (err.message?.startsWith("RECIPIENT_NOT_FOUND:")) {
+      return res.status(404).json({
+        success: false,
+        error: "RECIPIENT_NOT_FOUND",
+        message: err.message.split(":")[1],
+      });
+    }
+
+    if (err.message?.startsWith("INVALID_STATUS:")) {
+      return res.status(400).json({
+        success: false,
+        error: "INVALID_STATUS",
+        message: err.message.split(":")[1],
+      });
+    }
+
+    if (err.message?.startsWith("SELF_TRANSFER:")) {
+      return res.status(400).json({
+        success: false,
+        error: "SELF_TRANSFER",
+        message: err.message.split(":")[1],
+      });
+    }
+
+    if (err.message?.startsWith("DUPLICATE:")) {
+      return res.status(409).json({
+        success: false,
+        error: "DUPLICATE",
+        message: err.message.split(":")[1],
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      error: "INTERNAL_ERROR",
+      message: "Failed to transfer booking",
+    });
+  }
+});
+
 // DELETE /api/bookings/:id - Cancel booking with refund calculation
 router.delete("/:id", authenticate, async (req, res) => {
   try {
-    // Use an interactive transaction to prevent race conditions
-    // (two concurrent cancel requests for the same booking)
     const result = await prisma.$transaction(async (tx) => {
       const booking = await tx.booking.findUnique({
         where: { id: req.params.id as string },
         include: {
           event: true,
+          seatTier: true,
         },
       });
 
-      if (!booking) {
+      if (!booking || booking.status === "TRANSFERRED") {
         throw new Error("NOT_FOUND:Booking not found");
       }
 
@@ -470,7 +633,6 @@ router.delete("/:id", authenticate, async (req, res) => {
         );
       }
 
-      // Calculate refund using the shared refund engine
       const refund = calculateRefund(
         booking.pricePaid,
         new Date(booking.event.date),
@@ -482,7 +644,6 @@ router.delete("/:id", authenticate, async (req, res) => {
         throw new Error("PAST_EVENT:This event has already passed. Cancellation is not allowed.");
       }
 
-      // Update booking status and store refund amount + cancellation timestamp
       await tx.booking.update({
         where: { id: req.params.id as string },
         data: {
@@ -492,10 +653,8 @@ router.delete("/:id", authenticate, async (req, res) => {
         },
       });
 
-      // Decrement capacity using centralized helper
       await decrementCapacity(tx, booking);
 
-      // Restore promo code usage if one was applied
       if (booking.promoCodeId) {
         await tx.promoCode.update({
           where: { id: booking.promoCodeId },
@@ -503,16 +662,20 @@ router.delete("/:id", authenticate, async (req, res) => {
         });
       }
 
-      return refund;
+      const promotedBooking = await promoteNextWaitlistedUser(tx, booking);
+
+      return { refund, promotedBooking };
     });
 
     res.json({
       success: true,
       message: "Booking cancelled successfully",
       data: {
-        refundAmount: result.finalRefund,
-        refundPercentage: result.refundPercentage,
-        serviceFee: result.serviceFee,
+        refundAmount: result.refund.finalRefund,
+        refundPercentage: result.refund.refundPercentage,
+        serviceFee: result.refund.serviceFee,
+        waitlistPromoted: Boolean(result.promotedBooking),
+        promotedBookingId: result.promotedBooking?.id ?? null,
       },
     });
   } catch (error: unknown) {
@@ -574,7 +737,7 @@ router.get("/:id/qr", authenticate, async (req, res) => {
       where: { id: req.params.id as string },
     });
 
-    if (!booking) {
+    if (!booking || booking.status === "TRANSFERRED") {
       return res.status(404).json({
         success: false,
         error: "NOT_FOUND",
